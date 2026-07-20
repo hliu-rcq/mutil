@@ -1,3 +1,7 @@
+# Disclaimer
+Dit is gemaakt met behulp van AI. Bij deze repo zit een mutil-context.md-bestand met een samenvatting van de chatgeschiedenis. 
+Dankzij het contextbestand kun je de ontwikkeling voortzetten zonder credits te verspillen aan het opnieuw doorgronden van de tool.
+
 # mutil
 
 `mutil` is een kleine CLI-tool om Android-emulators van **MuMu Player** te
