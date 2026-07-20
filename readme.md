@@ -1,8 +1,8 @@
-# mutil
-
-**Disclaimer**
+# Disclaimer
 This is made with the use of ai. Attached to this repo is a **mutil-context.md** file with the chat history summed up.
 The context file makes it possible to continue development without needing to waste credits to understand the tool to recreate it. 
+
+# mutil
 
 `mutil` is a small CLI tool to start, stop and connect to **MuMu Player**
 Android emulators from the terminal. It was originally written (with Copilot) to
