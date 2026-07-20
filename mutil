@@ -1,0 +1,749 @@
+#!/bin/sh
+
+# 
+# mutil - MuMu Player utility
+# Author: HLIU
+# 
+
+VERSION="2.0"
+
+TAB=$(printf '\t')
+
+# Create a private temp file (mode 0600) for a generated PowerShell script.
+# Falls back to a PID-based name only if mktemp is unavailable.
+new_ps_file() {
+    mktemp "${TMPDIR:-/tmp}/mutil.XXXXXX.ps1" 2>/dev/null || echo "${TMPDIR:-/tmp}/mutil_$$.ps1"
+}
+
+# Print a diagnostic/error message to stderr.
+err() {
+    printf '%s\n' "$*" >&2
+}
+
+# Echo the path (unix style) to MuMuManager.exe, or nothing when not found.
+# Resolution order: $MUMU_MANAGER override, common install paths, then a
+# Windows lookup (running MuMu process, then the uninstall registry) so that
+# non-standard install locations are still found.
+find_manager() {
+    # 1. explicit override
+    if [ -n "$MUMU_MANAGER" ]; then
+        _p=$(cygpath -u "$MUMU_MANAGER" 2>/dev/null || printf '%s' "$MUMU_MANAGER")
+        [ -f "$_p" ] && { printf '%s\n' "$_p"; return 0; }
+    fi
+
+    # 2. common default install locations (fast path, no PowerShell needed)
+    for _p in \
+        "/c/Program Files/Netease/MuMuPlayer/nx_main/MuMuManager.exe" \
+        "/c/Program Files/Netease/MuMuPlayerGlobal-12.0/nx_main/MuMuManager.exe"; do
+        [ -f "$_p" ] && { printf '%s\n' "$_p"; return 0; }
+    done
+
+    # 3. ask Windows: running MuMu process path, then the uninstall registry
+    _mm=$(powershell.exe -NoProfile -ExecutionPolicy Bypass -Command '
+$ErrorActionPreference = "SilentlyContinue"
+$mm = $null
+$p = Get-Process MuMuNxMain, MuMuPlayer -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($p -and $p.Path) {
+    $c = Join-Path (Split-Path $p.Path) "MuMuManager.exe"
+    if (Test-Path $c) { $mm = $c }
+}
+if (-not $mm) {
+    $keys = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+    foreach ($k in $keys) {
+        if ($mm) { break }
+        Get-ItemProperty $k -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -match "MuMu" } |
+            ForEach-Object {
+                if ($mm) { return }
+                $bases = @()
+                if ($_.InstallLocation) { $bases += $_.InstallLocation }
+                if ($_.DisplayIcon) {
+                    $icon = ($_.DisplayIcon -replace ",.*$","") -replace "`"",""
+                    $bases += (Split-Path $icon)
+                    $bases += (Split-Path (Split-Path $icon))
+                }
+                if ($_.UninstallString) {
+                    $bases += (Split-Path ($_.UninstallString -replace "`"",""))
+                }
+                foreach ($b in $bases) {
+                    if ($mm) { break }
+                    if (-not $b -or -not (Test-Path $b)) { continue }
+                    foreach ($rel in @("MuMuManager.exe", "nx_main\MuMuManager.exe")) {
+                        $c = Join-Path $b $rel
+                        if (Test-Path $c) { $mm = $c; break }
+                    }
+                    if (-not $mm) {
+                        $f = Get-ChildItem -Path $b -Recurse -Filter "MuMuManager.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+                        if ($f) { $mm = $f.FullName }
+                    }
+                }
+            }
+    }
+}
+if ($mm) { $mm }
+' 2>/dev/null | tr -d '\r')
+
+    if [ -n "$_mm" ]; then
+        _mm=$(cygpath -u "$_mm" 2>/dev/null || printf '%s' "$_mm")
+        [ -f "$_mm" ] && { printf '%s\n' "$_mm"; return 0; }
+    fi
+
+    return 1
+}
+
+# Return 0 when the MuMu Player application is running. If tasklist is not
+# available the check is skipped (assumes running) to avoid false prompts.
+mumu_running() {
+    command -v tasklist >/dev/null 2>&1 || return 0
+    for _img in MuMuNxMain.exe MuMuPlayer.exe; do
+        tasklist //FI "IMAGENAME eq $_img" //NH 2>/dev/null | grep -qi "${_img%.exe}" && return 0
+    done
+    return 1
+}
+
+# Poll every 3s until MuMu Player is running (timeout 2 min).
+wait_mumu_running() {
+    _n=0
+    while ! mumu_running; do
+        _n=$((_n + 1))
+        if [ "$_n" -ge 40 ]; then
+            err "Timeout (2 min): MuMu Player did not start."
+            return 1
+        fi
+        echo "Waiting for MuMu Player to start... (checking every 3s)"
+        sleep 3
+    done
+}
+
+# Launch the MuMu Player application (detached) via its executable.
+start_mumu() {
+    _mm=$(find_manager) || { err "MuMuManager not found."; return 1; }
+    _dir=$(dirname "$_mm")
+    for _exe in "$_dir/MuMuNxMain.exe" "$_dir/MuMuPlayer.exe"; do
+        if [ -f "$_exe" ]; then
+            echo "Starting MuMu Player..."
+            cmd //c start "" "$(cygpath -w "$_exe")" >/dev/null 2>&1
+            wait_mumu_running
+            return
+        fi
+    done
+    err "Could not find the MuMu Player executable."
+    return 1
+}
+
+# Print prompt $1, read an answer, return 0 if it contains a "y"
+# (case-insensitive) so "y", "Y", "yes", "y\" etc. all count as yes.
+confirm_yes() {
+    printf '%s' "$1"
+    read -r _ans
+    case "$(printf '%s' "$_ans" | tr '[:upper:]' '[:lower:]')" in
+        *y*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# If MuMu Player is not running, ask whether to start it.
+ensure_mumu_running() {
+    mumu_running && return 0
+    if confirm_yes 'MuMu Player is not running. Start it? (Y/N): '; then
+        start_mumu
+    fi
+}
+
+# Return 0 when instance $2 (as seen by MuMuManager $1) is fully online.
+device_online() {
+    _info=$("$1" info -v "$2" 2>/dev/null | tr -d '\r')
+    printf '%s' "$_info" | grep -q '"is_android_started": true' || return 1
+    printf '%s' "$_info" | grep -q '"is_process_started": true'
+}
+
+# Return 0 when instance $2 is fully stopped (process not running).
+device_stopped() {
+    _info=$("$1" info -v "$2" 2>/dev/null | tr -d '\r')
+    printf '%s' "$_info" | grep -q '"is_process_started": true' && return 1
+    return 0
+}
+
+# Poll every 5s until predicate $4 holds for instance $2 (timeout 2 min).
+# $4 is a function name (device_online / device_stopped); $5 is a label used
+# in the waiting/timeout messages (e.g. "online", "stopped").
+wait_state() {
+    _mm=$1
+    _idx=$2
+    _name=$3
+    _pred=$4
+    _label=$5
+    _n=0
+    while ! "$_pred" "$_mm" "$_idx"; do
+        _n=$((_n + 1))
+        if [ "$_n" -ge 24 ]; then
+            err "Timeout (2 min): '$_name' did not become $_label."
+            return 1
+        fi
+        echo "Still waiting for '$_name' to be $_label... (checking every 5s)"
+        sleep 5
+    done
+}
+
+# Parse a comma-separated selection like "1,3,5" into validated line numbers
+# within [1, $2]. Echoes them space-separated; returns 1 on any invalid entry.
+parse_choices() {
+    _choice=$1
+    _count=$2
+    _out=""
+    _old_ifs=$IFS
+    IFS=','
+    for _tok in $_choice; do
+        IFS=$_old_ifs
+        _tok=$(printf '%s' "$_tok" | tr -d '[:space:]')
+        case "$_tok" in
+            ''|*[!0-9]*) return 1 ;;
+        esac
+        if [ "$_tok" -lt 1 ] || [ "$_tok" -gt "$_count" ]; then
+            return 1
+        fi
+        _out="$_out $_tok"
+    done
+    IFS=$_old_ifs
+    [ -n "$_out" ] || return 1
+    printf '%s\n' "${_out# }"
+}
+
+# Read lines on stdin and keep those whose tab-field $1 (1-based) contains the
+# needle $2 as a case-insensitive substring. Without a needle, passes all lines.
+filter_by_name() {
+    awk -F"$TAB" -v f="$1" -v n="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" '
+        n == "" || index(tolower($f), n) > 0
+    '
+}
+
+# Query MuMuManager once. Emits one line per instance:
+#   INDEX<TAB>NAME<TAB>STATUS<TAB>ADDR
+# STATUS is online (running), offline (stopped) or busy (mid-transition).
+# ADDR is "ip:port" for online instances, otherwise empty. For online
+# instances the Android emulator-range port (5554-5585) is preferred, because
+# Visual Studio and the Android SDK recognise it (unlike MuMu's high adb_port).
+mumu_query() {
+    MM=$(find_manager) || return 0
+
+    PS_FILE=$(new_ps_file)
+    trap 'rm -f "$PS_FILE"' EXIT INT TERM
+
+    cat > "$PS_FILE" <<'PS'
+$ErrorActionPreference = 'SilentlyContinue'
+
+$mm = $env:MUMU_MM
+if (-not $mm -or -not (Test-Path $mm)) { return }
+
+$raw = & $mm info -v all 2>$null | Out-String
+if (-not $raw.Trim()) { return }
+try { $obj = $raw | ConvertFrom-Json } catch { return }
+
+# Map each process id to its listening ports. netstat is used instead of
+# Get-NetTCPConnection because the latter can take several seconds per call.
+$listen = @{}
+foreach ($line in (netstat -ano)) {
+    if ($line -match '^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$') {
+        $op = [int]$matches[2]
+        if (-not $listen.ContainsKey($op)) { $listen[$op] = @() }
+        $listen[$op] += [int]$matches[1]
+    }
+}
+
+foreach ($prop in $obj.PSObject.Properties) {
+    $d = $prop.Value
+    $started = [bool]$d.is_android_started
+    $running = [bool]$d.is_process_started
+    if ($started -and $running) {
+        $status = 'online'
+    } elseif (-not $started -and -not $running) {
+        $status = 'offline'
+    } else {
+        # exactly one flag set = mid-start or mid-shutdown
+        $status = 'busy'
+    }
+
+    $addr = ''
+    if ($d.adb_port) {
+        $ip = if ($d.adb_host_ip) { $d.adb_host_ip } else { '127.0.0.1' }
+        $port = [int]$d.adb_port
+        $hpid = [int]$d.headless_pid
+        if ($hpid -and $listen.ContainsKey($hpid)) {
+            $emu = $listen[$hpid] |
+                Where-Object { $_ -ge 5554 -and $_ -le 5585 -and ($_ % 2) -eq 1 } |
+                Sort-Object | Select-Object -First 1
+            if ($emu) { $port = $emu }
+        }
+        $addr = '{0}:{1}' -f $ip, $port
+    }
+
+    ("{0}`t{1}`t{2}`t{3}" -f $prop.Name, $d.name, $status, $addr)
+}
+PS
+
+    MUMU_MM=$(cygpath -w "$MM") powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$PS_FILE")" 2>/dev/null | tr -d '\r'
+    rm -f "$PS_FILE"
+    trap - EXIT INT TERM
+}
+
+# All instances: INDEX<TAB>NAME<TAB>STATUS<TAB>ADB<TAB>ADDR
+# ADB is "connected" when the address is currently in `adb devices`, else "-".
+# ADDR (possibly empty) is kept last so read with IFS=TAB never mis-splits.
+list_full() {
+    _conn=$(adb devices 2>/dev/null | awk 'NR>1 && $1 ~ /:/ { print $1 }')
+    mumu_query | while IFS="$TAB" read -r _i _nm _st _ad; do
+        _c="-"
+        if [ -n "$_ad" ] && printf '%s\n' "$_conn" | grep -qxF "$_ad"; then
+            _c="connected"
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\n' "$_i" "$_nm" "$_st" "$_c" "$_ad"
+    done
+}
+
+# All instances, one per line: INDEX<TAB>NAME<TAB>STATUS
+list_instances() {
+    mumu_query | awk -F"$TAB" '{ printf "%s\t%s\t%s\n", $1, $2, $3 }'
+}
+
+# Echo the parenthetical annotation for STATUS $1, ADB flag $2 and ADDR $3.
+_annot() {
+    if [ -n "$3" ]; then
+        if [ "$2" = "connected" ]; then
+            echo "($1, adb: connected)"
+        else
+            echo "($1, adb: not connected)"
+        fi
+    else
+        echo "($1)"
+    fi
+}
+
+# Launch instance $2 and wait (max 2 min) until it is online.
+start_instance() {
+    _mm=$1
+    _idx=$2
+    _name=$3
+    echo "Starting $_name"
+    "$_mm" control -v "$_idx" launch >/dev/null 2>&1
+    wait_state "$_mm" "$_idx" "$_name" device_online "online" || return 1
+    echo "Started: $_name"
+}
+
+# Stop instance $2 and wait (max 2 min) until it is stopped.
+stop_instance() {
+    _mm=$1
+    _idx=$2
+    _name=$3
+    echo "Stopping $_name"
+    "$_mm" control -v "$_idx" shutdown >/dev/null 2>&1
+    wait_state "$_mm" "$_idx" "$_name" device_stopped "stopped" || return 1
+    echo "Stopped: $_name"
+}
+
+# adb-connect a device row; start it first when it is not online.
+connect_row() {
+    _mm=$1
+    _idx=$2
+    _name=$3
+    _status=$4
+    _addr=$5
+    _adb=$6
+
+    if [ "$_adb" = "connected" ]; then
+        echo "Already connected to $_name ($_addr)"
+        return 0
+    fi
+
+    if [ "$_status" != "online" ]; then
+        if [ -z "$_mm" ]; then
+            err "MuMuManager not found; cannot start '$_name'."
+            return 1
+        fi
+        start_instance "$_mm" "$_idx" "$_name" || return 1
+        _addr=$(mumu_query | awk -F"$TAB" -v i="$_idx" '$1 == i { print $4 }')
+    fi
+
+    if [ -z "$_addr" ]; then
+        err "Could not determine the adb address of '$_name'."
+        return 1
+    fi
+
+    echo "Connecting to $_name ($_addr)"
+    adb connect "$_addr"
+}
+
+cmd_devices() {
+    ROWS=$(list_full)
+
+    if [ -z "$ROWS" ]; then
+        err "No MuMu devices found."
+        return 1
+    fi
+
+    echo "MuMu devices:"
+    printf '%s\n' "$ROWS" | while IFS="$TAB" read -r IDX NAME STATUS ADB ADDR; do
+        [ -z "$NAME" ] && continue
+        _a=$(_annot "$STATUS" "$ADB" "$ADDR")
+        if [ -n "$ADDR" ]; then
+            printf '  %-28s %s %s\n' "$NAME" "$_a" "$ADDR"
+        else
+            printf '  %-28s %s\n' "$NAME" "$_a"
+        fi
+    done
+}
+
+
+cmd_connect() {
+    FILTER=$1
+
+    if ! command -v adb >/dev/null 2>&1; then
+        err "adb not found in PATH"
+        exit 1
+    fi
+
+    MM=$(find_manager)
+
+    ROWS=$(list_full)
+    if [ -n "$FILTER" ]; then
+        ROWS=$(printf '%s\n' "$ROWS" | filter_by_name 2 "$FILTER")
+        if [ -z "$ROWS" ]; then
+            err "No MuMu devices matching '$FILTER' found."
+            return 1
+        fi
+    else
+        # No name: list devices that are not yet adb-connected. Online ones only
+        # need an adb connect; offline/booting ones are started first (like open)
+        # and then connected. Already-connected devices are left out.
+        if [ -z "$ROWS" ]; then
+            err "No MuMu devices found."
+            return 1
+        fi
+        ROWS=$(printf '%s\n' "$ROWS" | awk -F"$TAB" '$4 != "connected"')
+        if [ -z "$ROWS" ]; then
+            echo "All MuMu devices are already connected."
+            return 0
+        fi
+    fi
+
+    COUNT=$(printf '%s\n' "$ROWS" | grep -c .)
+
+    if [ "$COUNT" -eq 1 ]; then
+        IDX=$(printf '%s' "$ROWS" | cut -f1)
+        NAME=$(printf '%s' "$ROWS" | cut -f2)
+        STATUS=$(printf '%s' "$ROWS" | cut -f3)
+        ADB=$(printf '%s' "$ROWS" | cut -f4)
+        ADDR=$(printf '%s' "$ROWS" | cut -f5)
+        connect_row "$MM" "$IDX" "$NAME" "$STATUS" "$ADDR" "$ADB"
+        return
+    fi
+
+    echo "MuMu devices:"
+    N=1
+    printf '%s\n' "$ROWS" | while IFS="$TAB" read -r IDX NAME STATUS ADB ADDR; do
+        [ -z "$NAME" ] && continue
+        printf '  %d) %-28s %s\n' "$N" "$NAME" "$(_annot "$STATUS" "$ADB" "$ADDR")"
+        N=$((N + 1))
+    done
+
+    printf 'Choose device(s) [1-%s, comma-separated, A=all]: ' "$COUNT"
+    read -r CHOICE
+
+    case "$CHOICE" in
+        a|A)
+            printf '%s\n' "$ROWS" | while IFS="$TAB" read -r IDX NAME STATUS ADB ADDR; do
+                [ -z "$NAME" ] && continue
+                connect_row "$MM" "$IDX" "$NAME" "$STATUS" "$ADDR" "$ADB"
+            done
+            return
+            ;;
+    esac
+
+    SELECT=$(parse_choices "$CHOICE" "$COUNT") || {
+        err "Invalid choice."
+        return 1
+    }
+
+    for NUM in $SELECT; do
+        LINE=$(printf '%s\n' "$ROWS" | sed -n "${NUM}p")
+        IDX=$(printf '%s' "$LINE" | cut -f1)
+        NAME=$(printf '%s' "$LINE" | cut -f2)
+        STATUS=$(printf '%s' "$LINE" | cut -f3)
+        ADB=$(printf '%s' "$LINE" | cut -f4)
+        ADDR=$(printf '%s' "$LINE" | cut -f5)
+        connect_row "$MM" "$IDX" "$NAME" "$STATUS" "$ADDR" "$ADB"
+    done
+}
+
+
+cmd_disconnect() {
+    FILTER=$1
+
+    if ! command -v adb >/dev/null 2>&1; then
+        err "adb not found in PATH"
+        exit 1
+    fi
+
+    DEVICES=$(list_full | awk -F"$TAB" '$4 == "connected" { printf "%s\t%s\n", $2, $5 }')
+
+    if [ -z "$DEVICES" ]; then
+        err "No connected devices found."
+        return 1
+    fi
+
+    if [ -n "$FILTER" ]; then
+        DEVICES=$(printf '%s\n' "$DEVICES" | filter_by_name 1 "$FILTER")
+        if [ -z "$DEVICES" ]; then
+            err "No connected devices matching '$FILTER' found."
+            return 1
+        fi
+    fi
+
+    COUNT=$(printf '%s\n' "$DEVICES" | grep -c .)
+
+    if [ "$COUNT" -eq 1 ]; then
+        NAME=$(printf '%s' "$DEVICES" | cut -f1)
+        ADDR=$(printf '%s' "$DEVICES" | cut -f2)
+        echo "Disconnecting $NAME ($ADDR)"
+        adb disconnect "$ADDR"
+        return
+    fi
+
+    echo "Connected devices:"
+    N=1
+    printf '%s\n' "$DEVICES" | while IFS="$TAB" read -r NAME ADDR; do
+        [ -z "$ADDR" ] && continue
+        printf '  %d) %-28s %s\n' "$N" "$NAME" "$ADDR"
+        N=$((N + 1))
+    done
+
+    printf 'Choose device(s) [1-%s, comma-separated, A=all]: ' "$COUNT"
+    read -r CHOICE
+
+    case "$CHOICE" in
+        a|A)
+            printf '%s\n' "$DEVICES" | while IFS="$TAB" read -r NAME ADDR; do
+                [ -z "$ADDR" ] && continue
+                echo "Disconnecting $NAME ($ADDR)"
+                adb disconnect "$ADDR"
+            done
+            return
+            ;;
+    esac
+
+    SELECT=$(parse_choices "$CHOICE" "$COUNT") || {
+        err "Invalid choice."
+        return 1
+    }
+
+    for NUM in $SELECT; do
+        LINE=$(printf '%s\n' "$DEVICES" | sed -n "${NUM}p")
+        NAME=$(printf '%s' "$LINE" | cut -f1)
+        ADDR=$(printf '%s' "$LINE" | cut -f2)
+        echo "Disconnecting $NAME ($ADDR)"
+        adb disconnect "$ADDR"
+    done
+}
+
+
+cmd_open() {
+    FILTER=$1
+
+    MM=$(find_manager)
+    if [ -z "$MM" ]; then
+        err "MuMuManager not found."
+        exit 1
+    fi
+
+    CANDIDATES=$(list_instances | awk -F"$TAB" '$3 == "offline"')
+
+    if [ -z "$CANDIDATES" ]; then
+        err "No offline MuMu devices found."
+        return 1
+    fi
+
+    if [ -n "$FILTER" ]; then
+        CANDIDATES=$(printf '%s\n' "$CANDIDATES" | filter_by_name 2 "$FILTER")
+        if [ -z "$CANDIDATES" ]; then
+            err "No offline MuMu devices matching '$FILTER' found."
+            return 1
+        fi
+    fi
+
+    COUNT=$(printf '%s\n' "$CANDIDATES" | grep -c .)
+
+    if [ "$COUNT" -eq 1 ]; then
+        INDEX=$(printf '%s' "$CANDIDATES" | cut -f1)
+        NAME=$(printf '%s' "$CANDIDATES" | cut -f2)
+        start_instance "$MM" "$INDEX" "$NAME"
+        return
+    fi
+
+    echo "Offline MuMu devices:"
+    N=1
+    printf '%s\n' "$CANDIDATES" | while IFS="$TAB" read -r INDEX NAME STATUS; do
+        [ -z "$NAME" ] && continue
+        printf '  %d) %s\n' "$N" "$NAME"
+        N=$((N + 1))
+    done
+
+    printf 'Choose device(s) [1-%s, comma-separated, A=all]: ' "$COUNT"
+    read -r CHOICE
+
+    case "$CHOICE" in
+        a|A)
+            printf '%s\n' "$CANDIDATES" | while IFS="$TAB" read -r INDEX NAME STATUS; do
+                [ -z "$NAME" ] && continue
+                start_instance "$MM" "$INDEX" "$NAME"
+            done
+            return
+            ;;
+    esac
+
+    SELECT=$(parse_choices "$CHOICE" "$COUNT") || {
+        err "Invalid choice."
+        return 1
+    }
+
+    for NUM in $SELECT; do
+        LINE=$(printf '%s\n' "$CANDIDATES" | sed -n "${NUM}p")
+        INDEX=$(printf '%s' "$LINE" | cut -f1)
+        NAME=$(printf '%s' "$LINE" | cut -f2)
+        start_instance "$MM" "$INDEX" "$NAME"
+    done
+}
+
+
+cmd_close() {
+    FILTER=$1
+
+    MM=$(find_manager)
+    if [ -z "$MM" ]; then
+        err "MuMuManager not found."
+        exit 1
+    fi
+
+    CANDIDATES=$(list_instances | awk -F"$TAB" '$3 == "online"')
+
+    if [ -z "$CANDIDATES" ]; then
+        err "No online MuMu devices found."
+        return 1
+    fi
+
+    if [ -n "$FILTER" ]; then
+        CANDIDATES=$(printf '%s\n' "$CANDIDATES" | filter_by_name 2 "$FILTER")
+        if [ -z "$CANDIDATES" ]; then
+            err "No online MuMu devices matching '$FILTER' found."
+            return 1
+        fi
+    fi
+
+    COUNT=$(printf '%s\n' "$CANDIDATES" | grep -c .)
+
+    if [ "$COUNT" -eq 1 ]; then
+        INDEX=$(printf '%s' "$CANDIDATES" | cut -f1)
+        NAME=$(printf '%s' "$CANDIDATES" | cut -f2)
+        stop_instance "$MM" "$INDEX" "$NAME"
+        return
+    fi
+
+    echo "Online MuMu devices:"
+    N=1
+    printf '%s\n' "$CANDIDATES" | while IFS="$TAB" read -r INDEX NAME STATUS; do
+        [ -z "$NAME" ] && continue
+        printf '  %d) %s\n' "$N" "$NAME"
+        N=$((N + 1))
+    done
+
+    printf 'Choose device(s) [1-%s, comma-separated, A=all]: ' "$COUNT"
+    read -r CHOICE
+
+    case "$CHOICE" in
+        a|A)
+            printf '%s\n' "$CANDIDATES" | while IFS="$TAB" read -r INDEX NAME STATUS; do
+                [ -z "$NAME" ] && continue
+                stop_instance "$MM" "$INDEX" "$NAME"
+            done
+            return
+            ;;
+    esac
+
+    SELECT=$(parse_choices "$CHOICE" "$COUNT") || {
+        err "Invalid choice."
+        return 1
+    }
+
+    for NUM in $SELECT; do
+        LINE=$(printf '%s\n' "$CANDIDATES" | sed -n "${NUM}p")
+        INDEX=$(printf '%s' "$LINE" | cut -f1)
+        NAME=$(printf '%s' "$LINE" | cut -f2)
+        stop_instance "$MM" "$INDEX" "$NAME"
+    done
+}
+
+
+cmd_help() {
+    cat <<EOF
+mutil $VERSION
+
+Usage:
+    mutil <command> [name]
+
+Commands:
+
+  MuMu Player (manage instances via MuMuManager):
+    devices     Show all devices with status and adb-connection
+    open        Start a stopped MuMu device (asks which if several)
+    close       Stop a running MuMu device (asks which if several)
+
+  adb (manage connections via adb):
+    connect     Connect adb to a device (starts it first if needed)
+    disconnect  Disconnect adb from a connected device
+
+  Other:
+    help        Show this help
+
+For open, close, connect and disconnect, [name] keeps only devices whose
+name contains it (case-insensitive). If exactly one matches, it runs at once.
+EOF
+}
+
+
+CMD=${1:-}
+[ "$#" -gt 0 ] && shift
+FILTER=$*
+
+case "$CMD" in
+    devices|open|close|connect|disconnect)
+        ensure_mumu_running
+        ;;
+esac
+
+case "$CMD" in
+    devices)
+        cmd_devices
+        ;;
+    open)
+        cmd_open "$FILTER"
+        ;;
+    close)
+        cmd_close "$FILTER"
+        ;;
+    connect)
+        cmd_connect "$FILTER"
+        ;;
+    disconnect)
+        cmd_disconnect "$FILTER"
+        ;;
+    help|"")
+        cmd_help
+        ;;
+    *)
+        err "Unknown command: $CMD"
+        cmd_help
+        exit 1
+        ;;
+esac
