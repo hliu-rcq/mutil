@@ -1,6 +1,6 @@
 # Disclaimer
 This is made with the use of ai. Attached to this repo is a **mutil-context.md** file with the chat history summed up.
-The context file makes it possible to continue development without needing to waste credits to understand the tool to recreate it. 
+The context file makes it possible to continue development without needing to waste credits to understand the tool.
 
 # mutil
 
